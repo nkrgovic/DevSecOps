@@ -1,0 +1,118 @@
+---
+- name: Setup Nginx on Rocky Linux 9 with Security Hardening
+  hosts: rocky_servers
+  become: yes
+
+  tasks:
+    - name: Install required packages
+      ansible.builtin.dnf:
+        name:
+          - nginx
+          - firewalld
+          - python3-libselinux
+          - python3-policycoreutils
+        state: present
+
+    - name: Ensure SELinux is enabled and enforcing
+      ansible.posix.selinux:
+        policy: targeted
+        state: enforcing
+      register: selinux_result
+
+    - name: Check if reboot is required for SELinux
+      ansible.builtin.debug:
+        msg: "SELinux mode changed. A reboot may be required."
+      when: selinux_result.reboot_required | default(false)
+
+    - name: Add noexec to /var mount point in fstab
+      ansible.posix.mount:
+        path: /var
+        src: "{{ ansible_mounts | selectattr('mount', 'equalto', '/var') | map(attribute='device') | first | default(omit) }}"
+        fstype: "{{ ansible_mounts | selectattr('mount', 'equalto', '/var') | map(attribute='fstype') | first | default('xfs') }}"
+        opts: "{{ ansible_mounts | selectattr('mount', 'equalto', '/var') | map(attribute='options') | first | default('defaults') }},noexec"
+        state: mounted
+      when: ansible_mounts | selectattr('mount', 'equalto', '/var') | list | length > 0
+
+    - name: Add noexec to /tmp mount point in fstab
+      ansible.posix.mount:
+        path: /tmp
+        src: "{{ ansible_mounts | selectattr('mount', 'equalto', '/tmp') | map(attribute='device') | first | default('tmpfs') }}"
+        fstype: "{{ ansible_mounts | selectattr('mount', 'equalto', '/tmp') | map(attribute='fstype') | first | default('tmpfs') }}"
+        opts: "{{ ansible_mounts | selectattr('mount', 'equalto', '/tmp') | map(attribute='options') | first | default('defaults') }},noexec"
+        state: mounted
+      when: ansible_mounts | selectattr('mount', 'equalto', '/tmp') | list | length > 0
+
+    - name: Create /tmp with noexec if not a separate mount
+      ansible.posix.mount:
+        path: /tmp
+        src: tmpfs
+        fstype: tmpfs
+        opts: defaults,noexec,nosuid,nodev
+        state: mounted
+      when: ansible_mounts | selectattr('mount', 'equalto', '/tmp') | list | length == 0
+
+    - name: Start and enable firewalld
+      ansible.builtin.systemd:
+        name: firewalld
+        state: started
+        enabled: yes
+
+    - name: Ensure firewalld uses nftables backend
+      ansible.builtin.lineinfile:
+        path: /etc/firewalld/firewalld.conf
+        regexp: '^FirewallBackend='
+        line: 'FirewallBackend=nftables'
+        state: present
+      notify: Restart firewalld
+
+    - name: Allow SSH through firewalld
+      ansible.posix.firewalld:
+        service: ssh
+        permanent: yes
+        state: enabled
+        immediate: yes
+
+    - name: Allow HTTP through firewalld
+      ansible.posix.firewalld:
+        service: http
+        permanent: yes
+        state: enabled
+        immediate: yes
+
+    - name: Allow HTTPS through firewalld
+      ansible.posix.firewalld:
+        service: https
+        permanent: yes
+        state: enabled
+        immediate: yes
+
+    - name: Create /var/www/html/storage directory
+      ansible.builtin.file:
+        path: /var/www/html/storage
+        state: directory
+        owner: nginx
+        group: nginx
+        mode: '0755'
+
+    - name: Set SELinux context for /var/www/html/storage
+      community.general.sefcontext:
+        target: '/var/www/html/storage(/.*)?'
+        setype: httpd_sys_rw_content_t
+        state: present
+
+    - name: Apply SELinux context to /var/www/html/storage
+      ansible.builtin.command:
+        cmd: restorecon -Rv /var/www/html/storage
+      changed_when: true
+
+    - name: Start and enable nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: started
+        enabled: yes
+
+  handlers:
+    - name: Restart firewalld
+      ansible.builtin.systemd:
+        name: firewalld
+        state: restarted
