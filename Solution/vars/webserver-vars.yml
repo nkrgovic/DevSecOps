@@ -1,0 +1,216 @@
+---
+# ========================================
+# Nginx Configuration Variables
+# ========================================
+nginx_user: nginx
+nginx_worker_processes: auto
+nginx_worker_connections: 1024
+nginx_client_max_body_size: 64m
+nginx_keepalive_timeout: 65
+nginx_server_tokens: "off"
+
+# Extra HTTP options - include rate limiting zones
+nginx_extra_http_options: |
+  # Rate limiting zones
+  limit_req_zone $binary_remote_addr zone=general:10m rate=10r/s;
+  limit_req_zone $binary_remote_addr zone=login:10m rate=5r/m;
+  limit_conn_zone $binary_remote_addr zone=addr:10m;
+
+  # Connection limits will be applied per server block
+
+nginx_vhosts:
+  - listen: "80"
+    server_name: "{{ ansible_default_ipv4.address }}"
+    root: "/var/www/html"
+    index: "index.php index.html"
+    state: "present"
+    extra_parameters: |
+      # Include security headers
+      include /etc/nginx/conf.d/hardening/security-headers.conf;
+
+      # Rate limiting and connection limits
+      limit_req zone=general burst=20 nodelay;
+      limit_conn addr 10;
+
+      location / {
+          try_files $uri $uri/ /index.php?$args;
+      }
+
+      location ~ \.php$ {
+          fastcgi_pass unix:/var/opt/remi/php83/run/php-fpm/www.sock;
+          fastcgi_index index.php;
+          fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+          include /etc/nginx/fastcgi_params;
+          fastcgi_buffers 16 16k;
+          fastcgi_buffer_size 32k;
+      }
+
+      location ~ /\.ht {
+          deny all;
+      }
+
+      location = /favicon.ico {
+          log_not_found off;
+          access_log off;
+      }
+
+      location = /robots.txt {
+          allow all;
+          log_not_found off;
+          access_log off;
+      }
+
+      location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg)$ {
+          expires max;
+          log_not_found off;
+      }
+
+# ModSecurity
+nginx_modsecurity_enabled: true
+
+# ========================================
+# PHP Configuration Variables
+# ========================================
+php_version: "8.3"
+php_default_version_debian: "8.3"
+php_webserver_daemon: "nginx"
+php_enable_php_fpm: true
+php_fpm_daemon: php83-php-fpm
+php_fpm_pool_user: nginx
+php_fpm_pool_group: nginx
+
+php_packages:
+  - php83-php-cli
+  - php83-php-common
+  - php83-php-fpm
+  - php83-php-mysqlnd
+  - php83-php-gd
+  - php83-php-xml
+  - php83-php-mbstring
+  - php83-php-json
+  - php83-php-opcache
+  - php83-php-zip
+  - php83-php-curl
+  - php83-php-intl
+  - php83-php-redis
+  - php83-php-imagick
+
+php_enablerepo: "remi,remi-php83"
+
+php_memory_limit: "256M"
+php_max_execution_time: "300"
+php_max_input_time: "300"
+php_post_max_size: "64M"
+php_upload_max_filesize: "64M"
+php_expose_php: "Off"
+php_display_errors: "Off"
+php_display_startup_errors: "Off"
+php_log_errors: "On"
+php_error_log: /var/log/php-fpm/error.log
+
+# OPcache settings for WordPress
+php_opcache_enable: "1"
+php_opcache_memory_consumption: "256"
+php_opcache_interned_strings_buffer: "16"
+php_opcache_max_accelerated_files: "10000"
+php_opcache_revalidate_freq: "60"
+php_opcache_validate_timestamps: "1"
+
+# ========================================
+# MySQL/MariaDB Configuration Variables
+# ========================================
+# IMPORTANT: Change these passwords before running in production!
+mysql_root_password: "MyStrongPassword1!"
+
+mysql_bind_address: '127.0.0.1'
+mysql_port: '3306'
+
+mysql_slow_query_log_enabled: true
+mysql_slow_query_log_file: /var/log/mysql/mysql-slow.log
+mysql_slow_query_time: 2
+
+mysql_key_buffer_size: "256M"
+mysql_max_allowed_packet: "64M"
+mysql_table_open_cache: "256"
+mysql_sort_buffer_size: "1M"
+mysql_read_buffer_size: "1M"
+mysql_read_rnd_buffer_size: "4M"
+mysql_myisam_sort_buffer_size: "64M"
+mysql_thread_cache_size: "8"
+mysql_max_connections: 151
+
+mysql_innodb_file_per_table: "1"
+mysql_innodb_buffer_pool_size: "256M"
+mysql_innodb_log_file_size: "64M"
+mysql_innodb_log_buffer_size: "8M"
+mysql_innodb_flush_log_at_trx_commit: "1"
+mysql_innodb_lock_wait_timeout: 50
+
+# ========================================
+# Redis Configuration Variables
+# ========================================
+redis_bind_interface: 127.0.0.1
+redis_port: 6379
+redis_maxmemory: 256mb
+redis_maxmemory_policy: allkeys-lru
+redis_save:
+  - 900 1
+  - 300 10
+  - 60 10000
+
+redis_disabled_commands:
+  - FLUSHDB
+  - FLUSHALL
+  - CONFIG
+
+# ========================================
+# Fail2Ban Configuration Variables
+# ========================================
+security_fail2ban_enabled: true
+security_autoupdate_enabled: true
+
+fail2ban_bantime: 3600
+fail2ban_findtime: 600
+fail2ban_maxretry: 5
+
+# ========================================
+# SSH Hardening Variables (for devsec.hardening.ssh_hardening)
+# ========================================
+ssh_server_ports: ['22']
+ssh_permit_root_login: 'no'
+ssh_password_authentication: 'no'
+ssh_pubkey_authentication: 'yes'
+ssh_challengeresponse_authentication: 'no'
+ssh_allow_tcp_forwarding: 'no'
+ssh_max_auth_tries: 3
+ssh_client_alive_interval: 300
+ssh_client_alive_count_max: 2
+ssh_max_sessions: 10
+ssh_permit_empty_passwords: 'no'
+ssh_allow_agent_forwarding: 'no'
+ssh_x11_forwarding: 'no'
+
+# SSH Ciphers and MACs (strong crypto only)
+ssh_ciphers:
+  - chacha20-poly1305@openssh.com
+  - aes256-gcm@openssh.com
+  - aes128-gcm@openssh.com
+
+ssh_macs:
+  - hmac-sha2-512-etm@openssh.com
+  - hmac-sha2-256-etm@openssh.com
+
+ssh_kex:
+  - curve25519-sha256@libssh.org
+  - diffie-hellman-group-exchange-sha256
+
+# ========================================
+# OS Hardening Variables (for devsec.hardening.os_hardening)
+# ========================================
+os_security_kernel_enable_core_dump: false
+os_security_suid_sgid_enforce_whitelist: true
+os_auth_pw_max_age: 60
+os_auth_pw_min_age: 7
+os_auth_retries: 3
+os_auth_timeout: 60
+

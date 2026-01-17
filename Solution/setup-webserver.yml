@@ -1,0 +1,752 @@
+---
+- name: Comprehensive WordPress Web Server Setup with Security Hardening
+  hosts: rocky_servers
+  become: yes
+
+  vars_files:
+    - vars/webserver-vars.yml
+
+  pre_tasks:
+    - name: Install required packages for Ansible modules
+      ansible.builtin.dnf:
+        name:
+          - python3-libselinux
+          - python3-policycoreutils
+          - python3-firewall
+          - policycoreutils-python-utils
+          - git
+        state: present
+
+    # Create nginx hardening configs before nginx role runs
+    - name: Create nginx hardening configuration directory
+      ansible.builtin.file:
+        path: /etc/nginx/conf.d/hardening
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      tags: ['nginx', 'hardening']
+
+    - name: Deploy nginx security headers configuration
+      ansible.builtin.copy:
+        dest: /etc/nginx/conf.d/hardening/security-headers.conf
+        content: |
+          # Security Headers
+          add_header X-Frame-Options "SAMEORIGIN" always;
+          add_header X-Content-Type-Options "nosniff" always;
+          add_header X-XSS-Protection "1; mode=block" always;
+          add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+          add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+
+          # Hide Nginx version
+          server_tokens off;
+
+          # SSL/TLS Configuration (enable when using HTTPS)
+          # ssl_protocols TLSv1.2 TLSv1.3;
+          # ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384';
+          # ssl_prefer_server_ciphers on;
+          # ssl_session_cache shared:SSL:10m;
+          # ssl_session_timeout 10m;
+        owner: root
+        group: root
+        mode: '0644'
+      tags: ['nginx', 'hardening']
+
+    # Create MySQL log directory before MySQL role runs
+    - name: Create MySQL log directory
+      ansible.builtin.file:
+        path: /var/log/mysql
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      tags: ['mysql', 'hardening']
+
+    # Remove old .my.cnf if it exists (to allow fresh configuration)
+    - name: Remove old .my.cnf if it exists
+      ansible.builtin.file:
+        path: /root/.my.cnf
+        state: absent
+      tags: ['mysql']
+
+  roles:
+    # System hardening using DevSec.io
+    - role: devsec.hardening.os_hardening
+      tags: ['hardening', 'os']
+
+    - role: devsec.hardening.ssh_hardening
+      tags: ['hardening', 'ssh']
+      vars:
+        ssh_permit_root_login: 'no'
+        ssh_password_authentication: 'no'
+        ssh_pubkey_authentication: 'yes'
+        ssh_challengeresponse_authentication: 'no'
+        ssh_allow_tcp_forwarding: 'no'
+        ssh_max_auth_tries: 3
+        ssh_client_alive_interval: 300
+        ssh_client_alive_count_max: 2
+
+    # Nginx installation and configuration
+    - role: geerlingguy.nginx
+      tags: ['nginx']
+
+    # PHP installation
+    - role: geerlingguy.repo-remi
+      tags: ['php']
+
+    - role: geerlingguy.php
+      tags: ['php']
+      vars:
+        php_version: '8.3'
+        php_packages_extra:
+          - php83-php-fpm
+          - php83-php-mysqlnd
+          - php83-php-gd
+          - php83-php-xml
+          - php83-php-mbstring
+          - php83-php-json
+          - php83-php-opcache
+          - php83-php-zip
+          - php83-php-curl
+          - php83-php-intl
+          - php83-php-redis
+
+    # Redis
+    - role: geerlingguy.redis
+      tags: ['redis']
+
+    # Fail2Ban
+    - role: geerlingguy.security
+      tags: ['fail2ban']
+      vars:
+        security_fail2ban_enabled: yes
+
+  tasks:
+    # ========================================
+    # MySQL/MariaDB Installation and Setup
+    # ========================================
+    # Custom implementation to avoid geerlingguy.mysql unix_socket issues
+
+    - name: Install MariaDB server and client
+      ansible.builtin.dnf:
+        name:
+          - mariadb-server
+          - mariadb
+          - python3-PyMySQL
+        state: present
+      tags: ['mysql']
+
+    - name: Start and enable MariaDB service
+      ansible.builtin.systemd:
+        name: mariadb
+        state: started
+        enabled: yes
+      tags: ['mysql']
+
+    - name: Set correct ownership on MySQL log directory
+      ansible.builtin.file:
+        path: /var/log/mysql
+        state: directory
+        owner: mysql
+        group: mysql
+        mode: '0755'
+      tags: ['mysql']
+
+    - name: Check if MariaDB root password is already set
+      ansible.builtin.shell: mariadb -u root -p'{{ mysql_root_password }}' -e "SELECT 1" 2>/dev/null
+      register: mysql_root_password_check
+      failed_when: false
+      changed_when: false
+      tags: ['mysql']
+      no_log: true
+
+    - name: Change MariaDB root authentication to password (Rocky 9 fix)
+      ansible.builtin.shell: |
+        sudo mariadb -e "ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING PASSWORD('{{ mysql_root_password }}');"
+        sudo mariadb -e "ALTER USER 'root'@'127.0.0.1' IDENTIFIED VIA mysql_native_password USING PASSWORD('{{ mysql_root_password }}');" 2>/dev/null || true
+        sudo mariadb -e "ALTER USER 'root'@'::1' IDENTIFIED VIA mysql_native_password USING PASSWORD('{{ mysql_root_password }}');" 2>/dev/null || true
+        sudo mariadb -e "FLUSH PRIVILEGES;"
+      when: mysql_root_password_check.rc != 0
+      tags: ['mysql']
+
+    - name: Create /root/.my.cnf with root credentials
+      ansible.builtin.copy:
+        dest: /root/.my.cnf
+        content: |
+          [client]
+          user=root
+          password={{ mysql_root_password }}
+        owner: root
+        group: root
+        mode: '0600'
+      tags: ['mysql']
+      no_log: true
+
+    - name: Remove anonymous MySQL users
+      community.mysql.mysql_user:
+        name: ''
+        host_all: yes
+        state: absent
+        login_unix_socket: /var/lib/mysql/mysql.sock
+      tags: ['mysql']
+
+    - name: Remove MySQL test database
+      community.mysql.mysql_db:
+        name: test
+        state: absent
+        login_unix_socket: /var/lib/mysql/mysql.sock
+      tags: ['mysql']
+
+    - name: Disallow root login remotely
+      community.mysql.mysql_query:
+        login_unix_socket: /var/lib/mysql/mysql.sock
+        query: DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1')
+      tags: ['mysql']
+
+    - name: Configure MariaDB settings
+      ansible.builtin.copy:
+        dest: /etc/my.cnf.d/server.cnf
+        content: |
+          [mysqld]
+          bind-address = {{ mysql_bind_address }}
+          port = {{ mysql_port }}
+
+          # Slow query log
+          slow_query_log = {{ mysql_slow_query_log_enabled | ternary('1', '0') }}
+          slow_query_log_file = {{ mysql_slow_query_log_file }}
+          long_query_time = {{ mysql_slow_query_time }}
+
+          # Performance tuning
+          key_buffer_size = {{ mysql_key_buffer_size }}
+          max_allowed_packet = {{ mysql_max_allowed_packet }}
+          table_open_cache = {{ mysql_table_open_cache }}
+          sort_buffer_size = {{ mysql_sort_buffer_size }}
+          read_buffer_size = {{ mysql_read_buffer_size }}
+          read_rnd_buffer_size = {{ mysql_read_rnd_buffer_size }}
+          myisam_sort_buffer_size = {{ mysql_myisam_sort_buffer_size }}
+          thread_cache_size = {{ mysql_thread_cache_size }}
+          max_connections = {{ mysql_max_connections }}
+
+          # InnoDB settings
+          innodb_file_per_table = {{ mysql_innodb_file_per_table }}
+          innodb_buffer_pool_size = {{ mysql_innodb_buffer_pool_size }}
+          innodb_log_file_size = {{ mysql_innodb_log_file_size }}
+          innodb_log_buffer_size = {{ mysql_innodb_log_buffer_size }}
+          innodb_flush_log_at_trx_commit = {{ mysql_innodb_flush_log_at_trx_commit }}
+          innodb_lock_wait_timeout = {{ mysql_innodb_lock_wait_timeout }}
+
+          # Security
+          local-infile = 0
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart mysql
+      tags: ['mysql']
+
+
+    # ========================================
+    # System Hardening - Sysctl
+    # ========================================
+    - name: Apply custom sysctl hardening parameters
+      ansible.posix.sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        sysctl_set: yes
+        state: present
+        reload: yes
+      loop:
+        # Network Security
+        - { name: 'net.ipv4.conf.all.accept_source_route', value: '0' }
+        - { name: 'net.ipv4.conf.default.accept_source_route', value: '0' }
+        - { name: 'net.ipv6.conf.all.accept_source_route', value: '0' }
+        - { name: 'net.ipv6.conf.default.accept_source_route', value: '0' }
+        - { name: 'net.ipv4.conf.all.accept_redirects', value: '0' }
+        - { name: 'net.ipv4.conf.default.accept_redirects', value: '0' }
+        - { name: 'net.ipv6.conf.all.accept_redirects', value: '0' }
+        - { name: 'net.ipv6.conf.default.accept_redirects', value: '0' }
+        - { name: 'net.ipv4.conf.all.secure_redirects', value: '0' }
+        - { name: 'net.ipv4.conf.default.secure_redirects', value: '0' }
+        - { name: 'net.ipv4.conf.all.send_redirects', value: '0' }
+        - { name: 'net.ipv4.conf.default.send_redirects', value: '0' }
+        - { name: 'net.ipv4.conf.all.rp_filter', value: '1' }
+        - { name: 'net.ipv4.conf.default.rp_filter', value: '1' }
+        - { name: 'net.ipv4.icmp_echo_ignore_all', value: '0' }
+        - { name: 'net.ipv4.icmp_echo_ignore_broadcasts', value: '1' }
+        - { name: 'net.ipv4.conf.all.log_martians', value: '1' }
+        - { name: 'net.ipv4.conf.default.log_martians', value: '1' }
+        - { name: 'net.ipv4.icmp_ignore_bogus_error_responses', value: '1' }
+        - { name: 'net.ipv4.tcp_syncookies', value: '1' }
+        - { name: 'net.ipv4.tcp_syn_retries', value: '2' }
+        - { name: 'net.ipv4.tcp_synack_retries', value: '2' }
+        - { name: 'net.ipv4.tcp_max_syn_backlog', value: '4096' }
+        - { name: 'net.ipv6.conf.all.disable_ipv6', value: '1' }
+        - { name: 'net.ipv6.conf.default.disable_ipv6', value: '1' }
+        - { name: 'net.ipv6.conf.lo.disable_ipv6', value: '1' }
+        - { name: 'net.ipv4.tcp_timestamps', value: '0' }
+        - { name: 'net.ipv4.tcp_fin_timeout', value: '15' }
+        - { name: 'net.ipv4.tcp_keepalive_time', value: '300' }
+        - { name: 'net.ipv4.tcp_keepalive_probes', value: '5' }
+        - { name: 'net.ipv4.tcp_keepalive_intvl', value: '15' }
+        - { name: 'net.core.rmem_max', value: '16777216' }
+        - { name: 'net.core.wmem_max', value: '16777216' }
+        - { name: 'net.ipv4.tcp_rmem', value: '4096 87380 16777216' }
+        - { name: 'net.ipv4.tcp_wmem', value: '4096 65536 16777216' }
+        # Kernel hardening
+        - { name: 'kernel.dmesg_restrict', value: '1' }
+        - { name: 'kernel.kptr_restrict', value: '2' }
+        - { name: 'kernel.yama.ptrace_scope', value: '1' }
+        - { name: 'kernel.panic', value: '10' }
+        - { name: 'kernel.panic_on_oops', value: '1' }
+        - { name: 'kernel.core_uses_pid', value: '1' }
+        - { name: 'fs.suid_dumpable', value: '0' }
+        - { name: 'fs.file-max', value: '65535' }
+        - { name: 'fs.protected_hardlinks', value: '1' }
+        - { name: 'fs.protected_symlinks', value: '1' }
+        - { name: 'fs.inotify.max_user_watches', value: '524288' }
+        - { name: 'vm.max_map_count', value: '262144' }
+        - { name: 'vm.swappiness', value: '10' }
+        - { name: 'vm.dirty_ratio', value: '15' }
+        - { name: 'vm.dirty_background_ratio', value: '5' }
+        - { name: 'vm.overcommit_memory', value: '1' }
+      tags: ['hardening', 'sysctl']
+
+    - name: Apply nf_conntrack sysctl parameters (if module loaded)
+      ansible.posix.sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        sysctl_set: yes
+        state: present
+        reload: yes
+        ignoreerrors: yes
+      loop:
+        - { name: 'net.netfilter.nf_conntrack_max', value: '262144' }
+        - { name: 'net.netfilter.nf_conntrack_tcp_timeout_established', value: '1200' }
+      tags: ['hardening', 'sysctl']
+
+    # ========================================
+    # SELinux Hardening
+    # ========================================
+    - name: Ensure SELinux is enabled and enforcing
+      ansible.posix.selinux:
+        policy: targeted
+        state: enforcing
+      tags: ['hardening', 'selinux']
+
+    - name: Set SELinux booleans for WordPress/httpd
+      ansible.posix.seboolean:
+        name: "{{ item }}"
+        state: yes
+        persistent: yes
+      loop:
+        - httpd_can_network_connect_db
+        - httpd_can_network_connect
+        - httpd_can_sendmail
+        - httpd_unified
+        - httpd_can_network_memcache
+      tags: ['hardening', 'selinux']
+
+    - name: Restore SELinux context for nginx runtime files
+      ansible.builtin.command:
+        cmd: restorecon -Rv /var/run/nginx.pid
+      changed_when: false
+      failed_when: false
+      tags: ['hardening', 'selinux', 'nginx']
+
+    # ========================================
+    # Firewalld Configuration
+    # ========================================
+    - name: Install and start firewalld
+      ansible.builtin.dnf:
+        name: firewalld
+        state: present
+      tags: ['firewall']
+
+    - name: Start and enable firewalld
+      ansible.builtin.systemd:
+        name: firewalld
+        state: started
+        enabled: yes
+      tags: ['firewall']
+
+    - name: Ensure firewalld uses nftables backend
+      ansible.builtin.lineinfile:
+        path: /etc/firewalld/firewalld.conf
+        regexp: '^FirewallBackend='
+        line: 'FirewallBackend=nftables'
+        state: present
+      notify: Restart firewalld
+      tags: ['firewall']
+
+    - name: Allow services through firewalld
+      ansible.posix.firewalld:
+        service: "{{ item }}"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      loop:
+        - ssh
+        - http
+        - https
+      tags: ['firewall']
+
+    # ========================================
+    # Mount Hardening
+    # ========================================
+    - name: Add noexec to /var mount point in fstab
+      ansible.posix.mount:
+        path: /var
+        src: "{{ ansible_mounts | selectattr('mount', 'equalto', '/var') | map(attribute='device') | first | default(omit) }}"
+        fstype: "{{ ansible_mounts | selectattr('mount', 'equalto', '/var') | map(attribute='fstype') | first | default('xfs') }}"
+        opts: "{{ ansible_mounts | selectattr('mount', 'equalto', '/var') | map(attribute='options') | first | default('defaults') }},noexec"
+        state: mounted
+      when: ansible_mounts | selectattr('mount', 'equalto', '/var') | list | length > 0
+      tags: ['hardening', 'mounts']
+
+    - name: Add noexec to /tmp mount point in fstab
+      ansible.posix.mount:
+        path: /tmp
+        src: "{{ ansible_mounts | selectattr('mount', 'equalto', '/tmp') | map(attribute='device') | first | default('tmpfs') }}"
+        fstype: "{{ ansible_mounts | selectattr('mount', 'equalto', '/tmp') | map(attribute='fstype') | first | default('tmpfs') }}"
+        opts: "{{ ansible_mounts | selectattr('mount', 'equalto', '/tmp') | map(attribute='options') | first | default('defaults') }},noexec"
+        state: mounted
+      when: ansible_mounts | selectattr('mount', 'equalto', '/tmp') | list | length > 0
+      tags: ['hardening', 'mounts']
+
+    - name: Create /tmp with noexec if not a separate mount
+      ansible.posix.mount:
+        path: /tmp
+        src: tmpfs
+        fstype: tmpfs
+        opts: defaults,noexec,nosuid,nodev
+        state: mounted
+      when: ansible_mounts | selectattr('mount', 'equalto', '/tmp') | list | length == 0
+      tags: ['hardening', 'mounts']
+
+    # ========================================
+    # Nginx Hardening (continued - ModSecurity)
+    # ========================================
+    # Note: Security headers and rate limiting configs are created in pre_tasks
+
+    - name: Install ModSecurity for Nginx
+      ansible.builtin.dnf:
+        name:
+          - nginx-mod-modsecurity
+        state: present
+      tags: ['nginx', 'modsecurity']
+
+    - name: Create ModSecurity directory
+      ansible.builtin.file:
+        path: /etc/nginx/modsec
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      tags: ['nginx', 'modsecurity']
+
+    - name: Download OWASP ModSecurity Core Rule Set
+      ansible.builtin.git:
+        repo: 'https://github.com/coreruleset/coreruleset.git'
+        dest: /etc/nginx/modsec/coreruleset
+        version: v4.0/main
+      tags: ['nginx', 'modsecurity']
+
+    - name: Copy CRS setup configuration
+      ansible.builtin.copy:
+        src: /etc/nginx/modsec/coreruleset/crs-setup.conf.example
+        dest: /etc/nginx/modsec/crs-setup.conf
+        remote_src: yes
+        owner: root
+        group: root
+        mode: '0644'
+      tags: ['nginx', 'modsecurity']
+
+    - name: Enable ModSecurity in nginx
+      ansible.builtin.copy:
+        dest: /etc/nginx/modsec/modsecurity.conf
+        content: |
+          SecRuleEngine On
+          SecRequestBodyAccess On
+          SecResponseBodyAccess Off
+          SecRequestBodyLimit 13107200
+          SecRequestBodyNoFilesLimit 131072
+          SecRequestBodyLimitAction Reject
+          SecPcreMatchLimit 100000
+          SecPcreMatchLimitRecursion 100000
+          SecDebugLog /var/log/nginx/modsec_debug.log
+          SecDebugLogLevel 0
+          SecAuditEngine RelevantOnly
+          SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+          SecAuditLogParts ABIJDEFHZ
+          SecAuditLogType Serial
+          SecAuditLog /var/log/nginx/modsec_audit.log
+          SecArgumentSeparator &
+          SecCookieFormat 0
+          SecTmpDir /tmp/
+          SecDataDir /tmp/
+
+          Include /etc/nginx/modsec/crs-setup.conf
+          Include /etc/nginx/modsec/coreruleset/rules/*.conf
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload nginx
+      tags: ['nginx', 'modsecurity']
+
+    # ========================================
+    # PHP-FPM Configuration and Hardening
+    # ========================================
+    - name: Configure PHP-FPM to run as nginx user
+      ansible.builtin.lineinfile:
+        path: /etc/opt/remi/php83/php-fpm.d/www.conf
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: '^user =', line: 'user = nginx' }
+        - { regexp: '^group =', line: 'group = nginx' }
+        - { regexp: '^listen.owner =', line: 'listen.owner = nginx' }
+        - { regexp: '^listen.group =', line: 'listen.group = nginx' }
+        - { regexp: '^listen.mode =', line: 'listen.mode = 0660' }
+      notify: Restart php-fpm
+      tags: ['php', 'hardening']
+
+    - name: Harden PHP configuration (php.ini)
+      ansible.builtin.lineinfile:
+        path: /etc/opt/remi/php83/php.ini
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: '^expose_php =', line: 'expose_php = Off' }
+        - { regexp: '^display_errors =', line: 'display_errors = Off' }
+        - { regexp: '^log_errors =', line: 'log_errors = On' }
+        - { regexp: '^allow_url_fopen =', line: 'allow_url_fopen = On' }
+        - { regexp: '^allow_url_include =', line: 'allow_url_include = Off' }
+        - { regexp: '^session.cookie_httponly =', line: 'session.cookie_httponly = 1' }
+        - { regexp: '^session.cookie_secure =', line: 'session.cookie_secure = 1' }
+        - { regexp: '^session.use_strict_mode =', line: 'session.use_strict_mode = 1' }
+        - { regexp: '^disable_functions =', line: 'disable_functions = exec,passthru,shell_exec,system,proc_open,popen,curl_exec,curl_multi_exec,parse_ini_file,show_source' }
+        - { regexp: '^max_execution_time =', line: 'max_execution_time = 300' }
+        - { regexp: '^max_input_time =', line: 'max_input_time = 300' }
+        - { regexp: '^memory_limit =', line: 'memory_limit = 256M' }
+        - { regexp: '^post_max_size =', line: 'post_max_size = 64M' }
+        - { regexp: '^upload_max_filesize =', line: 'upload_max_filesize = 64M' }
+      notify: Restart php-fpm
+      tags: ['php', 'hardening']
+
+    - name: Enable and start PHP-FPM
+      ansible.builtin.systemd:
+        name: php83-php-fpm
+        state: started
+        enabled: yes
+      tags: ['php']
+
+    # ========================================
+    # Redis Hardening
+    # ========================================
+    - name: Harden Redis configuration
+      ansible.builtin.lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: '^bind ', line: 'bind 127.0.0.1' }
+        - { regexp: '^protected-mode ', line: 'protected-mode yes' }
+        - { regexp: '^port ', line: 'port 6379' }
+        - { regexp: '^# maxmemory ', line: 'maxmemory 256mb' }
+        - { regexp: '^# maxmemory-policy ', line: 'maxmemory-policy allkeys-lru' }
+        - { regexp: '^# rename-command CONFIG', line: 'rename-command CONFIG ""' }
+        - { regexp: '^# rename-command FLUSHDB', line: 'rename-command FLUSHDB ""' }
+        - { regexp: '^# rename-command FLUSHALL', line: 'rename-command FLUSHALL ""' }
+      notify: Restart redis
+      tags: ['redis', 'hardening']
+
+    - name: Ensure Redis only listens on localhost
+      ansible.builtin.lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: '^bind-source-addr'
+        state: absent
+      notify: Restart redis
+      tags: ['redis', 'hardening']
+
+    # ========================================
+    # MySQL Hardening and Setup
+    # ========================================
+    # Note: MySQL log directory is created in pre_tasks
+    # Note: Root password, databases, and users are managed by geerlingguy.mysql role
+
+    - name: Configure MySQL to listen only on localhost
+      ansible.builtin.lineinfile:
+        path: /etc/my.cnf.d/server.cnf
+        insertafter: '^\[mysqld\]'
+        line: 'bind-address = 127.0.0.1'
+        state: present
+      notify: Restart mysql
+      tags: ['mysql', 'hardening']
+
+    - name: Disable MySQL LOAD DATA LOCAL INFILE
+      ansible.builtin.lineinfile:
+        path: /etc/my.cnf.d/server.cnf
+        insertafter: '^\[mysqld\]'
+        line: 'local-infile = 0'
+        state: present
+      notify: Restart mysql
+      tags: ['mysql', 'hardening']
+
+    - name: Enable MySQL binary logging (for point-in-time recovery)
+      ansible.builtin.lineinfile:
+        path: /etc/my.cnf.d/server.cnf
+        insertafter: '^\[mysqld\]'
+        line: "{{ item }}"
+        state: present
+      loop:
+        - 'log-bin = /var/log/mysql/mysql-bin.log'
+        - 'expire_logs_days = 7'
+        - 'max_binlog_size = 100M'
+      notify: Restart mysql
+      tags: ['mysql', 'hardening']
+
+    # ========================================
+    # Directory Structure and Permissions
+    # ========================================
+    - name: Create /var/www/html directory structure
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: nginx
+        mode: '0755'
+      loop:
+        - /var/www/html
+      tags: ['filesystem']
+
+    - name: Create /var/www/html/storage directory
+      ansible.builtin.file:
+        path: /var/www/html/storage
+        state: directory
+        owner: nginx
+        group: nginx
+        mode: '0775'
+      tags: ['filesystem']
+
+    - name: Set SELinux context for /var/www/html
+      community.general.sefcontext:
+        target: '/var/www/html(/.*)?'
+        setype: httpd_sys_content_t
+        state: present
+      tags: ['selinux', 'filesystem']
+
+    - name: Set SELinux context for /var/www/html/storage
+      community.general.sefcontext:
+        target: '/var/www/html/storage(/.*)?'
+        setype: httpd_sys_rw_content_t
+        state: present
+      tags: ['selinux', 'filesystem']
+
+    - name: Apply SELinux context to /var/www/html
+      ansible.builtin.command:
+        cmd: restorecon -Rv /var/www/html
+      changed_when: true
+      tags: ['selinux', 'filesystem']
+
+    # ========================================
+    # Fail2Ban Configuration
+    # ========================================
+    - name: Create Fail2Ban nginx filter
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/filter.d/nginx-http-auth.conf
+        content: |
+          [Definition]
+          failregex = ^ \[error\] \d+#\d+: \*\d+ user "\S+":? (password mismatch|was not found in ".*"), client: <HOST>, server: \S+, request: "\S+ \S+ HTTP/\d+\.\d+", host: "\S+"\s*$
+                      ^ \[error\] \d+#\d+: \*\d+ no user/password was provided for basic authentication, client: <HOST>, server: \S+, request: "\S+ \S+ HTTP/\d+\.\d+", host: "\S+"\s*$
+          ignoreregex =
+        owner: root
+        group: root
+        mode: '0644'
+      tags: ['fail2ban']
+
+    - name: Configure Fail2Ban jails
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/jail.local
+        content: |
+          [DEFAULT]
+          bantime = 3600
+          findtime = 600
+          maxretry = 5
+
+          [sshd]
+          enabled = true
+          port = ssh
+          logpath = /var/log/secure
+
+          [nginx-http-auth]
+          enabled = true
+          filter = nginx-http-auth
+          port = http,https
+          logpath = /var/log/nginx/error.log
+          maxretry = 3
+
+          [nginx-noscript]
+          enabled = true
+          port = http,https
+          filter = nginx-noscript
+          logpath = /var/log/nginx/access.log
+          maxretry = 6
+
+          [nginx-badbots]
+          enabled = true
+          port = http,https
+          filter = nginx-badbots
+          logpath = /var/log/nginx/access.log
+          maxretry = 2
+
+          [nginx-noproxy]
+          enabled = true
+          port = http,https
+          filter = nginx-noproxy
+          logpath = /var/log/nginx/access.log
+          maxretry = 2
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart fail2ban
+      tags: ['fail2ban']
+
+    - name: Enable and start Fail2Ban
+      ansible.builtin.systemd:
+        name: fail2ban
+        state: started
+        enabled: yes
+      tags: ['fail2ban']
+
+  handlers:
+    - name: Restart firewalld
+      ansible.builtin.systemd:
+        name: firewalld
+        state: restarted
+
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+
+    - name: Restart php-fpm
+      ansible.builtin.systemd:
+        name: php83-php-fpm
+        state: restarted
+
+    - name: Restart redis
+      ansible.builtin.systemd:
+        name: redis
+        state: restarted
+
+    - name: Restart mysql
+      ansible.builtin.systemd:
+        name: mariadb
+        state: restarted
+
+    - name: Restart fail2ban
+      ansible.builtin.systemd:
+        name: fail2ban
+        state: restarted
